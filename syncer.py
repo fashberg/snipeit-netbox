@@ -488,16 +488,18 @@ class Syncer:
 
         # check if we altered the netbox name to avoid conflict
         oldname = nb_device['name']
+        name_has_suffix = False
 
         if oldname is not None and oldname.rfind(snipe_device['asset_tag']) > 1:
             # strip the tag
             oldname = oldname[0:oldname.rfind(snipe_device['asset_tag'])-1]
+            name_has_suffix = True
 
 
         # snipe's empty name can be an empty string rather then None
         check_name = snipe_device['name'] if len(snipe_device['name']) > 0 else None
 
-        if oldname != check_name:
+        if oldname != check_name or name_has_suffix:
             if check_name is None:
                 # no check needed, Netbox allows multiple Devices without Name
                 name = None
@@ -508,7 +510,9 @@ class Syncer:
                 else:
                     name = snipe_device['name']
 
-            update_dict = update_dict | {'name': name}
+            # only update if the name actually changes (e.g. conflict still exists and suffix stays)
+            if name != nb_device['name']:
+                update_dict = update_dict | {'name': name}
 
 
         if len(update_dict.values()) > 1:
