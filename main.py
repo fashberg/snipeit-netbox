@@ -13,6 +13,7 @@ if __name__ == "__main__":
     parser.add_argument('--allow-linking', action='store_true')
     parser.add_argument('--update-unique-existing', action='store_true')
     parser.add_argument('--no-append-assettag', action='store_true')
+    parser.add_argument('--sync-notes', action='store_true')
     args = parser.parse_args()
 
     config = configparser.ConfigParser()
@@ -24,7 +25,7 @@ if __name__ == "__main__":
     netbox = pynetbox.api(config['config']['netbox_url'], config['config']['netbox_token'])
 
     logging.info("Checking Netbox Custom Fields")
-    syncer = syncer.Syncer(netbox, snipe, args.allow_update, args.allow_linking)
+    syncer = syncer.Syncer(netbox, snipe, args.allow_update, args.allow_linking, args.sync_notes)
     syncer.ensure_netbox_custom_field(False)
 
     logging.info("Syncing Companies")

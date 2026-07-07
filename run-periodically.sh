@@ -6,7 +6,7 @@ fi
 while true ; do 
     echo "Running import"
     cd /app
-    python main.py --allow-update --allow-linking --update-unique-existing
+    python main.py --allow-update --allow-linking --update-unique-existing --sync-notes
     echo "done, sleeping $SLEEP seconds"
     sleep $SLEEP
 done

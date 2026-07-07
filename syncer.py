@@ -7,15 +7,17 @@ from datetime import datetime, timezone
 import pynetbox
 
 KEY_CUSTOM_FIELD = "snipe_object_id"
+KEY_NOTES_FIELD = "snipe_notes"
 DEFAULT_SITE_NAME = "Default Site"
 
 
 class Syncer:
-    def __init__(self, netbox, snipe, allow_updates: bool = False, allow_linking: bool = False):
+    def __init__(self, netbox, snipe, allow_updates: bool = False, allow_linking: bool = False, sync_notes: bool = False):
         self.netbox = netbox
         self.snipe = snipe
         self.allow_updates = allow_updates
         self.allow_linking = allow_linking
+        self.sync_notes = sync_notes
         self.desc = "Imported from SnipeIT {}".format(datetime.now(timezone.utc).strftime("%y-%m-%d %H:%M:%S (UTC)"))
 
 
@@ -27,11 +29,43 @@ class Syncer:
         return re.sub(r"[-\s]+", "-", value).strip("-_")
 
 
+    # matches a single "Updated from SnipeIT <timestamp> (UTC)" stamp with optional " (suffix)"
+    UPDATE_STAMP_RE = re.compile(
+        r"(?:\r\n\r\n)?Updated from SnipeIT \d{2}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \(UTC\)(?: \([^)]*\))?"
+    )
+
     def __gen_update_comment(self, old_comment: str, suffix: str = None):
-        val = old_comment + '\r\n\r\n' + self.desc.replace("Imported", "Updated")
+        # replace any previously-appended stamps so the comment does not grow on every run
+        base = Syncer.UPDATE_STAMP_RE.sub("", old_comment or "").rstrip("\r\n")
+        stamp = self.desc.replace("Imported", "Updated")
         if suffix is not None:
-            val += " (" + suffix + ")"
-        return val
+            stamp += " (" + suffix + ")"
+        return (base + "\r\n\r\n" + stamp) if base else stamp
+
+    # the fixed prefix used to embed SnipeIT notes into the comments field on create
+    NOTES_COMMENT_PREFIX = "Notes from SnipeIT when initially creating this Netbox Entry. \n "
+
+    @staticmethod
+    def __format_snipe_notes(notes) -> str:
+        if not notes:
+            return ""
+        return str(notes).replace('\r\n', '\r\n\r\n')
+
+    @staticmethod
+    def __strip_notes_from_comments(comments: str, snipe_notes) -> str:
+        """
+        Remove the SnipeIT notes that were previously embedded into the comments field.
+        Used when notes are moved to their own custom field so they are not duplicated.
+        Returns the comments with the notes block removed.
+        """
+        if not comments:
+            return comments or ""
+
+        embedded = Syncer.NOTES_COMMENT_PREFIX + Syncer.__format_snipe_notes(snipe_notes)
+        result = comments.replace(embedded, "")
+        # also drop a bare prefix (empty notes) if present
+        result = result.replace(Syncer.NOTES_COMMENT_PREFIX, "")
+        return result.strip("\r\n")
 
     def __get_fallback_site(self, company_name=None):
 
@@ -60,21 +94,25 @@ class Syncer:
 
         return fallback_site
 
+    def __ensure_custom_field(self, cufi: dict):
+        field = self.netbox.extras.custom_fields.get(name=cufi["name"])
+        if field is None:
+            logging.info("netbox custom field {} is missing -> creating one".format(cufi["name"]))
+            self.netbox.extras.custom_fields.create(cufi)
+        else:
+            logging.info("netbox custom field {} is present -> updating".format(cufi["name"]))
+            self.netbox.extras.custom_fields.update([cufi | {"id": field['id']}])
+
     def ensure_netbox_custom_field(self, lock: bool = False):
         content_types = ['dcim.device', 'dcim.devicetype', 'dcim.interface', 'dcim.manufacturer', 'dcim.site', 'dcim.devicerole',
                          'dcim.location', 'tenancy.tenant']
-        cufi = {"name": KEY_CUSTOM_FIELD, "display": "Snipe object id", "object_types": content_types,
-                "description": "The ID of the original SnipeIT Object used for Sync",
-                "type": "integer", "ui_visibility": "read-only" if lock else "read-write"}
+        self.__ensure_custom_field({"name": KEY_CUSTOM_FIELD, "display": "Snipe object id", "object_types": content_types,
+                                    "description": "The ID of the original SnipeIT Object used for Sync",
+                                    "type": "integer", "ui_visibility": "read-only" if lock else "read-write"})
 
-        field = self.netbox.extras.custom_fields.get(name=KEY_CUSTOM_FIELD)
-        if field is None:
-            logging.info("netbox custom field is missing -> creating one")
-            self.netbox.extras.custom_fields.create(cufi)
-        else:
-            logging.info("netbox custom field is present -> updating")
-            cufi = cufi | {"id": field['id']}
-            self.netbox.extras.custom_fields.update([cufi])
+        self.__ensure_custom_field({"name": KEY_NOTES_FIELD, "display": "Snipe notes", "object_types": ['dcim.device'],
+                                    "description": "The notes of the original SnipeIT Asset, synced one-way",
+                                    "type": "longtext", "ui_visibility": "read-only" if lock else "read-write"})
 
     def sync_companies_to_tenants(self, snipe_companies):
         netbox_tenants = list(self.netbox.tenancy.tenants.all())
@@ -525,8 +563,31 @@ class Syncer:
                 changed_reasons.append("name: {!r} -> {!r}".format(nb_device['name'], name))
 
 
-        if len(update_dict.values()) > 1:
-            update_dict = update_dict | {"comments": self.__gen_update_comment(nb_device['comments'], "Snipe ID" if "custom_fields" in update_dict.keys() else "Values")}
+        base_comments = nb_device['comments']
+        comments_stripped = False
+
+        # force a rewrite if the comment has accumulated more than one update stamp,
+        # so old multi-stamp comments get collapsed to a single (latest) stamp
+        if len(Syncer.UPDATE_STAMP_RE.findall(nb_device['comments'] or "")) > 1:
+            comments_stripped = True
+            changed_reasons.append("comments (collapsed stamps)")
+
+        if self.sync_notes:
+            snipe_notes = Syncer.__format_snipe_notes(snipe_device['notes'])
+
+            # move notes into their own field, removing any previously-embedded copy from comments
+            base_comments = Syncer.__strip_notes_from_comments(base_comments, snipe_device['notes'])
+            if base_comments != nb_device['comments']:
+                comments_stripped = True
+                changed_reasons.append("comments (stripped embedded notes)")
+
+            if nb_device['custom_fields'].get(KEY_NOTES_FIELD) != snipe_notes:
+                merged_cf = update_dict.get("custom_fields", {}) | {KEY_NOTES_FIELD: snipe_notes}
+                update_dict = update_dict | {"custom_fields": merged_cf}
+                changed_reasons.append("snipe_notes")
+
+        if len(update_dict.values()) > 1 or comments_stripped:
+            update_dict = update_dict | {"comments": self.__gen_update_comment(base_comments, "Snipe ID" if "custom_fields" in update_dict.keys() else "Values")}
             logging.info("Updating Device id=%s tag=%s reasons=%s", nb_device['id'], snipe_device['asset_tag'], changed_reasons)
             logging.info("Updating Device {}".format(update_dict))
             self.netbox.dcim.devices.update([update_dict])
@@ -582,10 +643,16 @@ class Syncer:
             name = snipe_asset['asset_tag']
 
         logging.info("Adding Device to netbox, name {}".format(name))
+        if self.sync_notes:
+            comments = ""
+            custom_fields = {KEY_CUSTOM_FIELD: snipe_asset['id'],
+                             KEY_NOTES_FIELD: Syncer.__format_snipe_notes(snipe_asset['notes'])}
+        else:
+            comments = Syncer.NOTES_COMMENT_PREFIX + Syncer.__format_snipe_notes(snipe_asset['notes'])
+            custom_fields = {KEY_CUSTOM_FIELD: snipe_asset['id']}
+
         device = self.netbox.dcim.devices.create(name=name,
-                                                 comments="Notes from SnipeIT when initially creating this Netbox Entry. "
-                                                          "\n " +
-                                                          str(snipe_asset['notes']).replace('\r\n', '\r\n\r\n'),
+                                                 comments=comments,
                                                  description=self.desc,
                                                  status=nb_status,
                                                  site=nb_site['id'] if nb_site else 1,
@@ -594,7 +661,7 @@ class Syncer:
                                                  serial=snipe_asset['serial'],
                                                  device_type=nb_device_type['id'],
                                                  tenant=nb_tenant['id'] if nb_tenant is not None else None,
-                                                 custom_fields={KEY_CUSTOM_FIELD: snipe_asset['id']})
+                                                 custom_fields=custom_fields)
 
         netbox_devices.append(device)
 
