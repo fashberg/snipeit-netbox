@@ -461,30 +461,39 @@ class Syncer:
         :param update_custom_field_id: This sets when the linking ID should be updated
         """
         update_dict = {'id': nb_device['id']}
+        changed_reasons = []
 
         if update_custom_field_id:
             update_dict = update_dict | {"custom_fields": {KEY_CUSTOM_FIELD: snipe_device['id']}}
+            changed_reasons.append("custom_fields (link)")
 
         if nb_device['asset_tag'] != snipe_device['asset_tag']:
             update_dict = update_dict | {'asset_tag': snipe_device['asset_tag']}
+            changed_reasons.append("asset_tag: {!r} -> {!r}".format(nb_device['asset_tag'], snipe_device['asset_tag']))
 
         if nb_device['serial'] != snipe_device['serial']:
             update_dict = update_dict | {'serial': snipe_device['serial']}
+            changed_reasons.append("serial: {!r} -> {!r}".format(nb_device['serial'], snipe_device['serial']))
 
         if nb_site and nb_device['site']['id'] != nb_site['id']:
             update_dict = update_dict | {'site': nb_site['id']}
+            changed_reasons.append("site: {} -> {}".format(nb_device['site']['id'], nb_site['id']))
 
         if nb_device['role']['id'] != nb_role['id']:
             update_dict = update_dict | {'role': nb_role['id']}
+            changed_reasons.append("role: {} -> {}".format(nb_device['role']['id'], nb_role['id']))
 
         if nb_tenant and nb_device['tenant'] and nb_device['tenant']['id'] != nb_tenant['id']:
             update_dict = update_dict | {'tenant': nb_tenant['id']}
+            changed_reasons.append("tenant: {} -> {}".format(nb_device['tenant']['id'], nb_tenant['id']))
 
         if nb_device['device_type']['id'] != nb_device_type['id']:
             update_dict = update_dict | {'device_type': nb_device_type['id']}
+            changed_reasons.append("device_type: {} -> {}".format(nb_device['device_type']['id'], nb_device_type['id']))
 
         if nb_device['status']['value'] != nb_status:
             update_dict = update_dict | {'status': nb_status}
+            changed_reasons.append("status: {!r} -> {!r}".format(nb_device['status']['value'], nb_status))
 
         # check if we altered the netbox name to avoid conflict
         oldname = nb_device['name']
@@ -513,10 +522,12 @@ class Syncer:
             # only update if the name actually changes (e.g. conflict still exists and suffix stays)
             if name != nb_device['name']:
                 update_dict = update_dict | {'name': name}
+                changed_reasons.append("name: {!r} -> {!r}".format(nb_device['name'], name))
 
 
         if len(update_dict.values()) > 1:
             update_dict = update_dict | {"comments": self.__gen_update_comment(nb_device['comments'], "Snipe ID" if "custom_fields" in update_dict.keys() else "Values")}
+            logging.info("Updating Device id=%s tag=%s reasons=%s", nb_device['id'], snipe_device['asset_tag'], changed_reasons)
             logging.info("Updating Device {}".format(update_dict))
             self.netbox.dcim.devices.update([update_dict])
 
